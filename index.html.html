@@ -278,27 +278,47 @@
   </div>
 </div>
 
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script>
+  
+const SUPABASE_URL  = 'https://sxyaorwkgvbucntshfwd.supabase.co';
+const SUPABASE_ANON = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InN4eWFvcndrZ3ZidWNudHNoZndkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzYwNTg3OTksImV4cCI6MjA5MTYzNDc5OX0.A5MeKKkechfiCcA5YICGuqR87pdEvM7bbuzYCL9VF6c'
+
+const sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON);
+
 const COLORS = ['#2B4A3F','#7F6D9A','#C0613A','#3A6C8A','#A3562A','#5A8A3A','#8A3A5A','#3A5A8A','#6B6B6B'];
-let members = JSON.parse(localStorage.getItem('wg2_members') || '[]');
-let votes   = JSON.parse(localStorage.getItem('wg2_votes')   || '{}');
+let members = [];
+let votes   = {};   // { memberId_day: 'yes'|'no' }
 let current = null;
 let selColor = COLORS[0];
 
-function save() {
-  localStorage.setItem('wg2_members', JSON.stringify(members));
-  localStorage.setItem('wg2_votes',   JSON.stringify(votes));
+function initials(n) { return n.split(' ').map(w=>w[0]).join('').toUpperCase().slice(0,2); }
+
+/* ── LOAD ── */
+async function loadAll() {
+  setLoading(true);
+  const [{ data: mData }, { data: vData }] = await Promise.all([
+    sb.from('members').select('*').order('created_at'),
+    sb.from('votes').select('*')
+  ]);
+  members = mData || [];
+  votes = {};
+  (vData || []).forEach(v => { votes[`${v.member_id}_${v.day}`] = v.value; });
+  setLoading(false);
+  renderAll();
 }
 
-function initials(name) {
-  return name.split(' ').map(w => w[0]).join('').toUpperCase().slice(0,2);
+function setLoading(on) {
+  document.getElementById('days-grid').style.opacity = on ? '0.4' : '1';
 }
 
-function lightColor(hex) {
-  // returns a soft tint
-  return hex + '22';
-}
+/* ── REALTIME ── */
+sb.channel('wg-changes')
+  .on('postgres_changes', { event: '*', schema: 'public', table: 'members' }, loadAll)
+  .on('postgres_changes', { event: '*', schema: 'public', table: 'votes' },   loadAll)
+  .subscribe();
 
+/* ── RENDER ── */
 function renderAll() {
   renderChips();
   renderSidebar();
@@ -307,21 +327,15 @@ function renderAll() {
 }
 
 function renderChips() {
-  const row = document.getElementById('chips-row');
-  row.innerHTML = members.map(m =>
+  document.getElementById('chips-row').innerHTML = members.map(m =>
     `<div class="chip${current&&current.id===m.id?' active':''}" onclick="selectMember('${m.id}')">
-      <div class="chip-dot" style="background:${m.color}"></div>
-      ${m.name}
-    </div>`
-  ).join('');
+      <div class="chip-dot" style="background:${m.color}"></div>${m.name}
+    </div>`).join('');
 }
 
 function renderSidebar() {
   const el = document.getElementById('sidebar-members');
-  if (!members.length) {
-    el.innerHTML = '<div style="font-size:12px;color:var(--muted);padding:4px 10px;">No members yet.</div>';
-    return;
-  }
+  if (!members.length) { el.innerHTML = '<div style="font-size:12px;color:var(--muted);padding:4px 10px;">No members yet.</div>'; return; }
   el.innerHTML = members.map(m => {
     const isMe = current && current.id === m.id;
     return `<div class="member-row${isMe?' me':''}" onclick="selectMember('${m.id}')">
@@ -337,13 +351,22 @@ function selectMember(id) {
   renderAll();
 }
 
-function vote(day, val) {
+/* ── VOTE ── */
+async function vote(day, val) {
   if (!current) return;
-  const key = `${current.id}_${day}`;
-  votes[key] = votes[key] === val ? null : val;
-  if (votes[key] === null) delete votes[key];
-  save();
+  const existing = votes[`${current.id}_${day}`];
+  const newVal = existing === val ? null : val;
+
+  // optimistic update
+  if (newVal) votes[`${current.id}_${day}`] = newVal;
+  else delete votes[`${current.id}_${day}`];
   renderCal();
+
+  if (newVal) {
+    await sb.from('votes').upsert({ member_id: current.id, day, value: newVal }, { onConflict: 'member_id,day' });
+  } else {
+    await sb.from('votes').delete().eq('member_id', current.id).eq('day', day);
+  }
 }
 
 function renderCal() {
@@ -352,9 +375,7 @@ function renderCal() {
   const today = new Date();
   const isThisMonth = today.getFullYear()===2025 && today.getMonth()===3;
   let html = '';
-
   for (let i = 0; i < firstDow; i++) html += `<div class="day-cell empty"></div>`;
-
   for (let d = 1; d <= 30; d++) {
     const isToday = isThisMonth && today.getDate()===d;
     const myVote = current ? (votes[`${current.id}_${d}`] || null) : null;
@@ -365,11 +386,8 @@ function renderCal() {
       if (v === 'yes') return `<div class="vdot" style="background:${m.color}" title="${m.name}: yes"></div>`;
       return `<div class="vdot no-vote" style="color:${m.color}" title="${m.name}: no"></div>`;
     }).join('');
-
     html += `<div class="day-cell${isToday?' today':''}${noMemberClass}">
-      <div class="day-num-row">
-        <div class="day-num">${d}</div>
-      </div>
+      <div class="day-num-row"><div class="day-num">${d}</div></div>
       <div class="vote-btns">
         <div class="vbtn${myVote==='yes'?' yes':''}" onclick="vote(${d},'yes')">Yes</div>
         <div class="vbtn${myVote==='no'?' no':''}" onclick="vote(${d},'no')">No</div>
@@ -380,7 +398,7 @@ function renderCal() {
   grid.innerHTML = html;
 }
 
-/* ---- Modal ---- */
+/* ── MODAL ── */
 function openModal() {
   document.getElementById('name-input').value = '';
   document.getElementById('modal-err').textContent = '';
@@ -393,30 +411,29 @@ function closeModal(e) {
   if (e && e.target !== document.getElementById('overlay')) return;
   document.getElementById('overlay').classList.remove('open');
 }
-document.getElementById('name-input').addEventListener('keydown', e => { if (e.key === 'Enter') createMember(); });
-document.addEventListener('keydown', e => { if (e.key === 'Escape') document.getElementById('overlay').classList.remove('open'); });
+document.getElementById('name-input').addEventListener('keydown', e => { if (e.key==='Enter') createMember(); });
+document.addEventListener('keydown', e => { if (e.key==='Escape') document.getElementById('overlay').classList.remove('open'); });
 
 function renderColorPicker() {
   document.getElementById('color-picker').innerHTML = COLORS.map(c =>
-    `<div class="cpick${c===selColor?' sel':''}" style="background:${c}" onclick="pickColor('${c}')"></div>`
-  ).join('');
+    `<div class="cpick${c===selColor?' sel':''}" style="background:${c}" onclick="pickColor('${c}')"></div>`).join('');
 }
 function pickColor(c) { selColor = c; renderColorPicker(); }
 
-function createMember() {
+async function createMember() {
   const name = document.getElementById('name-input').value.trim();
-  const err = document.getElementById('modal-err');
+  const err  = document.getElementById('modal-err');
   if (!name) { err.textContent = 'Please enter a name.'; return; }
-  if (members.find(m => m.name.toLowerCase() === name.toLowerCase())) { err.textContent = 'Name already taken.'; return; }
-  const member = { id: Date.now().toString(), name, color: selColor };
-  members.push(member);
-  current = member;
-  save();
+  if (members.find(m => m.name.toLowerCase()===name.toLowerCase())) { err.textContent = 'Name already taken.'; return; }
+  const { data, error } = await sb.from('members').insert({ name, color: selColor }).select().single();
+  if (error) { err.textContent = 'Could not save. Check your Supabase config.'; return; }
+  current = data;
   document.getElementById('overlay').classList.remove('open');
-  renderAll();
+  await loadAll();
 }
 
-renderAll();
+renderColorPicker();
+loadAll();
 </script>
 </body>
 </html>
